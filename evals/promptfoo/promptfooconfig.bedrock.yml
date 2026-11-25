@@ -1,0 +1,47 @@
+# Bedrock 版（bedrock モード）の評価。使い方は evals/README.md の「Bedrock で評価する」
+#   npx promptfoo eval -c promptfooconfig.bedrock.yml --no-cache -o output/bedrock.json
+# 合否と集計は promptfooconfig.yml と同じ（同じデータ・同じ指標で比べるため）
+description: slack inspection - ViolationDetector eval (PJT04 dataset, Amazon Bedrock)
+
+providers:
+  - id: file://provider.py
+    label: bedrock-nova-lite
+    config:
+      mode: bedrock
+      model: amazon.nova-lite-v1:0   # 地域によっては推論プロファイルの ID（例: apac.amazon.nova-lite-v1:0）
+      workers: 2                     # スロットリング（ThrottlingException）が出たら下げる
+  # Nova Micro とも比べるときは、下の行を有効にする（費用と時間は 2 倍）
+  # - id: file://provider.py
+  #   label: bedrock-nova-micro
+  #   config:
+  #     mode: bedrock
+  #     model: us.amazon.nova-micro-v1:0
+  #     workers: 2
+
+prompts:
+  - "{{text}}"
+
+defaultTest:
+  assert:
+    - type: javascript
+      metric: Detection
+      value: |
+        if (output.error) {
+          return { pass: false, score: 0, reason: `判定の失敗: ${output.error}` };
+        }
+        const ok = output.is_violation === context.vars.expected_is_violation;
+        return { pass: ok, score: ok ? 1 : 0,
+                 reason: `expected=${context.vars.expected_is_violation} got=${output.is_violation} (${output.method})` };
+    - type: javascript
+      metric: Article
+      weight: 0
+      value: |
+        if (output.error || !context.vars.expected_is_violation || !output.is_violation) {
+          return { pass: true, score: 1, reason: '対象外' };
+        }
+        const ok = output.article_id === context.vars.expected_article;
+        return { pass: true, score: ok ? 1 : 0,
+                 reason: `expected=${context.vars.expected_article} got=${output.article_id}` };
+
+tests:
+  - file://datasets/testcases.yaml

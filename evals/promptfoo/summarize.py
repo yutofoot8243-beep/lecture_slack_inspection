@@ -151,12 +151,19 @@ def main() -> int:
     # 予備経路・API の応答コード
     methods: dict[str, int] = defaultdict(int)
     statuses: dict[int, int] = defaultdict(int)
+    converse: dict[str, int] = defaultdict(int)
     for rec in first.values():
         methods[rec["out"].get("method") or "失敗"] += 1
         for c in rec["out"].get("calls") or []:
             if c.get("api") == "decisions":
                 statuses[c.get("status")] += 1
-    print(f"- 判定の方法: {dict(methods)}。Decisions API の応答コード（再試行を含む）: {dict(statuses)}")
+            elif c.get("api") == "converse":
+                converse[str(c.get("status"))] += 1
+    line = f"- 判定の方法: {dict(methods)}。Decisions API の応答コード（再試行を含む）: {dict(statuses)}"
+    if converse:
+        # tool_use 以外（end_turn・max_tokens や ThrottlingException など）は、答えの形が崩れた・失敗した呼び出し
+        line += f"。Bedrock の呼び出しの結果（stopReason か例外）: {dict(converse)}"
+    print(line)
 
     # 時間と費用
     ok = [rec["out"] for rec in first.values() if not rec["out"].get("error")]

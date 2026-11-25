@@ -3,8 +3,8 @@
 本番の判定のコード（`lambda/app_inspect/services/violation_detector.py` の `ViolationDetector`）を、そのまま [promptfoo](https://promptfoo.dev) から呼んで評価します。
 プロンプトだけを評価するのではなく、本番と同じ 2 段の判定（Decisions API → 条文の選択、失敗時の予備経路）を通すので、評価の結果がそのまま本番の判定の精度になります。
 
-- 対象の方式: `decisions`（新方式・本番）、`luna`（予備経路だけ）、`llm_score`（旧方式）。新しい方式（例: Amazon Bedrock）を `ViolationDetector` に足せば、同じ評価をそのまま流せます（下の「新しい方式を評価する」）
-- データ: 発注書 PJT04 の評価用データセット（架空の投稿 258 件。6 言語の対訳と言語混在）。**リポジトリには置きません**
+- 対象の方式: `decisions`（新方式・本番）、`luna`（予備経路だけ）、`llm_score`（旧方式）、`bedrock`（予備経路と同じ 2 段の判定を Amazon Bedrock で行う。下の「Bedrock で評価する」）
+- データ: 発注書 PJT04 の評価用データセット（架空の投稿 354 件。58 のシナリオを 6 言語で書いた対訳と、言語混在 6 件）。**リポジトリには置きません**
 
 ---
 
@@ -27,7 +27,7 @@
 
 あわせて、間違えた投稿の id ごとに、警告の確率（P(warn)）と条文の候補の上位 3 つを出します。新方式は「違反なし」と判定すると条文を付けない（`article_id` が `null`）ので、取りこぼしの分析には Decisions API の条文の候補を使います。
 
-件数が少ない（言語ごとに 42 件、警告すべきは 22 件前後）ので、**率と件数を必ず並べて**報告してください（1 件で率が約 0.045 動きます）。
+件数が少ない（言語ごとに 58 件、うち警告すべきは 25 件）ので、**率と件数を必ず並べて**報告してください（言語ごとの再現率は 1 件で 0.04 動きます）。
 
 単価（USD / 100 万トークン）は `docs/research/20261013_detection_model_migration.md` の 6.2 の値です（`promptfoo/harness.py` の `PRICES`）。
 
@@ -77,7 +77,7 @@ API キーは環境変数 `OPENAI_API_KEY` から読みます（無ければ、�
 ```bash
 cd evals/promptfoo
 ../.venv/bin/python load_dataset.py <データセットのパス>/eval_posts.jsonl
-# → datasets/testcases.yaml（258 件）
+# → datasets/testcases.yaml（354 件）
 ```
 
 ---
@@ -103,7 +103,7 @@ npx promptfoo eval --filter-first-n 5 --no-cache -o output/smoke.json
 - 同時に判定する数は `promptfooconfig.yml` の `workers`（既定 4）。スロットリング（429）が多いときは下げる
 - 方式を替えるときは `promptfooconfig.yml` の `config.mode`（と `model`）を変える。複数の方式を並べて比べるなら、`providers` に `label` を変えて並べる
 - `--share` は使わない（結果に投稿の本文が入るため、外部に送らない）
-- 費用の目安: 新方式で 258 件 × 1 回あたり約 0.14 ドル
+- 費用の目安: 新方式で 258 件 × 1 回あたり約 0.14 ドル（データセットが 258 件だったときの値。354 件ならその約 1.4 倍）
 
 ### 結果の見方
 
@@ -134,6 +134,35 @@ npx promptfoo view
 2. `promptfoo/harness.py` の `MODELS` に方式と既定のモデルを足す。OpenAI 以外のクライアントを使う場合は、`get_client()` と呼び出しの記録（トークン数・時間）、`PRICES` も足す
 3. `promptfooconfig.yml` の `providers` に、その方式の行を足す（`label` で区別する）
 4. 同じデータセット・同じ指標（`summarize.py`）で、今の方式と比べる
+
+---
+
+## Bedrock で評価する
+
+`bedrock` モードは、予備経路（`luna`）と同じ 2 段の判定（warn/safe と条文の候補 → 条文を 1 つ選ぶ）を、Amazon Bedrock の Converse API で行います。OpenAI の json_schema の代わりに、ツールを 1 つ渡して `toolChoice` で呼ばせ、その入力を答えとして読みます。Bedrock は `enum` を守る保証が無いので、`decision`・条文 ID はコードで確かめ、範囲外なら判定の失敗にします（「違反なし」と混ぜない）。
+
+```bash
+cd evals/promptfoo
+export PROMPTFOO_PYTHON=$PWD/../.venv/bin/python
+export PROMPTFOO_DISABLE_TELEMETRY=1
+
+# AWS の認証情報（講座の AWS 環境のもの）と地域。OpenAI のキーは要らない
+export AWS_PROFILE=...            # またはアクセスキーの環境変数
+export BEDROCK_REGION=...         # 例: ap-northeast-1
+
+# 費用の計算に使う単価（USD / 100 万トークン）。地域・モデルで違うので、公式の価格ページで確かめて入れる
+# 無ければ費用は 0 として数え、警告が出る
+export BEDROCK_PRICE_IN=...
+export BEDROCK_PRICE_OUT=...
+
+# まず数件で試す → 全件
+npx promptfoo eval -c promptfooconfig.bedrock.yml --filter-first-n 5 --no-cache -o output/bedrock_smoke.json
+npx promptfoo eval -c promptfooconfig.bedrock.yml --repeat 3 --no-cache -o output/bedrock.json
+../.venv/bin/python summarize.py output/bedrock.json --csv output/bedrock_summary.csv
+```
+
+- モデルは `promptfooconfig.bedrock.yml` の `model`（無ければ環境変数 `BEDROCK_MODEL_ID`、既定は `amazon.nova-lite-v1:0`）。地域によっては推論プロファイルの ID（`apac.`・`us.` などで始まる）を使う
+- `summarize.py` は、Bedrock の呼び出しの結果（`stopReason` か例外の種類）も数える。`tool_use` 以外が多いときは、答えの形が崩れている
 
 ---
 

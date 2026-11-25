@@ -32,7 +32,11 @@ from openai import OpenAI  # noqa: E402
 
 import app_inspect.services.violation_detector as vd  # noqa: E402
 
-MODELS = {"decisions": "gpt-6-luna", "luna": "gpt-6-luna", "llm_score": "gpt-4o-mini"}
+MODELS = {
+    "decisions": "gpt-6-luna", "luna": "gpt-6-luna", "llm_score": "gpt-4o-mini",
+    # bedrock の既定のモデル。地域によっては推論プロファイルの ID（例: apac.amazon.nova-lite-v1:0）にする
+    "bedrock": os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-lite-v1:0"),
+}
 ERROR_PREFIX = "LLM判定エラー"
 TRANSIENT_STATUS = {429, 500, 502, 503, 504}
 RETRY_WAIT_SEC = 3.0
@@ -44,6 +48,21 @@ PRICES = {
     ("chat", "gpt-6-luna"): {"in": 0.10, "cached": 0.01, "out": 0.50},
     ("chat", "gpt-4o-mini"): {"in": 0.15, "cached": 0.075, "out": 0.60},
 }
+
+
+def _bedrock_price() -> dict | None:
+    """Bedrock（Converse）の単価（USD / 100 万トークン）。地域とモデルで違うので、公式の価格ページで確かめて
+    環境変数で渡す: BEDROCK_PRICE_IN・BEDROCK_PRICE_OUT（・BEDROCK_PRICE_CACHED。無ければ入力と同じ）。
+    無ければ None（費用は 0 として数え、警告を 1 回出す）"""
+    try:
+        p_in = float(os.environ["BEDROCK_PRICE_IN"])
+        p_out = float(os.environ["BEDROCK_PRICE_OUT"])
+    except (KeyError, ValueError):
+        return None
+    return {"in": p_in, "cached": float(os.environ.get("BEDROCK_PRICE_CACHED", p_in)), "out": p_out}
+
+
+_warned_no_price = False
 
 _tl = threading.local()
 
@@ -80,6 +99,31 @@ class RecordingClient:
         self._real = real
         self.api_key = real.api_key
         self.chat = _Chat(real.chat)
+
+
+class RecordingBedrock:
+    """boto3 の bedrock-runtime の代わり。ViolationDetector は converse だけを使う。
+    トークン数・時間・失敗の種類を、1 投稿ごとの記録に残す"""
+
+    def __init__(self, real):
+        self._real = real
+
+    def converse(self, **kw):
+        t0 = time.time()
+        rec = {"api": "converse", "model": kw.get("modelId"), "in": 0, "cached": 0, "out": 0}
+        try:
+            resp = self._real.converse(**kw)
+        except Exception as e:
+            code = getattr(e, "response", {}).get("Error", {}).get("Code") if hasattr(e, "response") else None
+            rec.update({"sec": round(time.time() - t0, 3), "status": code or type(e).__name__})
+            _calls().append(rec)
+            raise
+        u = resp.get("usage", {}) or {}
+        rec.update({"in": u.get("inputTokens", 0) or 0, "cached": u.get("cacheReadInputTokens", 0) or 0,
+                    "out": u.get("outputTokens", 0) or 0, "sec": round(time.time() - t0, 3),
+                    "status": resp.get("stopReason")})
+        _calls().append(rec)
+        return resp
 
 
 _real_post = requests.post
@@ -161,22 +205,58 @@ def load_api_key() -> str:
 
 
 _client = None
+_bedrock = None
+_patched = False
 _client_lock = threading.Lock()
+
+
+def _ensure_patches(prompts_from_head: bool) -> None:
+    global _patched
+    if not _patched:
+        install_patches(prompts_from_head)
+        _patched = True
 
 
 def get_client(prompts_from_head: bool = False) -> RecordingClient:
     global _client
     with _client_lock:
+        _ensure_patches(prompts_from_head)
         if _client is None:
-            install_patches(prompts_from_head)
             _client = RecordingClient(OpenAI(api_key=load_api_key(), max_retries=2, timeout=60))
     return _client
 
 
+def get_bedrock_client(prompts_from_head: bool = False) -> RecordingBedrock:
+    """Bedrock のクライアント。認証情報は boto3 の通常の方法（AWS_PROFILE・環境変数など）で読む。
+    地域は BEDROCK_REGION（無ければ boto3 の既定）。OpenAI のキーは要らない"""
+    global _bedrock
+    with _client_lock:
+        _ensure_patches(prompts_from_head)
+        if _bedrock is None:
+            import boto3
+            from botocore.config import Config
+
+            _bedrock = RecordingBedrock(boto3.client(
+                "bedrock-runtime",
+                region_name=os.environ.get("BEDROCK_REGION") or None,
+                config=Config(connect_timeout=vd.BEDROCK_CONNECT_TIMEOUT_SECONDS,
+                              read_timeout=vd.BEDROCK_READ_TIMEOUT_SECONDS),
+            ))
+    return _bedrock
+
+
 def cost_of(calls: list[dict]) -> float:
+    global _warned_no_price
     total = 0.0
     for c in calls:
-        p = PRICES.get((c.get("api"), c.get("model")))
+        if c.get("api") == "converse":
+            p = _bedrock_price()
+            if p is None and not _warned_no_price:
+                _warned_no_price = True
+                print("警告: BEDROCK_PRICE_IN・BEDROCK_PRICE_OUT が無いので、Bedrock の費用は 0 として数える",
+                      file=sys.stderr)
+        else:
+            p = PRICES.get((c.get("api"), c.get("model")))
         if not p:
             continue
         cached = c.get("cached", 0) or 0
@@ -188,12 +268,16 @@ def detect(text: str, mode: str = "decisions", model: str | None = None, retries
            prompts_from_head: bool = False) -> dict:
     """本番の ViolationDetector で 1 投稿を判定し、評価用の結果を返す（判定の失敗は error に入る）"""
     model = model or MODELS[mode]
-    client = get_client(prompts_from_head)
+    if mode == "bedrock":
+        client, bedrock = None, get_bedrock_client(prompts_from_head)
+    else:
+        client, bedrock = get_client(prompts_from_head), None
     last_err = ""
     calls: list = []
     for attempt in range(retries + 1):
         _tl.calls = []
-        det = vd.ViolationDetector(openai_client=client, judge_model=model, detection_mode=mode)
+        det = vd.ViolationDetector(openai_client=client, judge_model=model, detection_mode=mode,
+                                   bedrock_client=bedrock)
         t0 = time.time()
         try:
             res = det.detect(text)
