@@ -80,6 +80,20 @@ cd evals/promptfoo
 # → datasets/testcases.yaml（354 件）
 ```
 
+### 開発用（dev）と最終評価用（test）に分ける
+
+判定方式の改善は dev だけを見て行い、test は改善が終わってから測ります（データセットに合わせすぎないため）。`split_dataset.py` がシナリオ単位で分けます。同じシナリオの対訳（6 言語）は同じ側に入り、系列（W・S・JH・X）× 警告すべきか、の層ごとに同じ割合（既定は test 4 割）にします。シードは固定（既定 20261125）なので、同じデータなら毎回同じ分け方になります。
+
+```bash
+cd evals/promptfoo
+../.venv/bin/python split_dataset.py <データセットのパス>/eval_posts.jsonl
+# → datasets/split.json・eval_posts_dev.jsonl（シナリオ 39・214 件）・eval_posts_test.jsonl（シナリオ 25・140 件）
+../.venv/bin/python load_dataset.py datasets/eval_posts_dev.jsonl   # dev で評価するとき（testcases.yaml を作り直す）
+```
+
+- ベースラインは、全件・dev・test のそれぞれで出しておく（発注書の M-3 は全件。改善前後の比較は test で行う）
+- test は言語ごとに警告すべき投稿が 10 件なので、1 件で再現率が 0.1 動く。件数と率を並べて報告する
+
 ---
 
 ## 実行

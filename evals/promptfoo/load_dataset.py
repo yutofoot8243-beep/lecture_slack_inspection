@@ -15,8 +15,6 @@ import json
 import sys
 from pathlib import Path
 
-import yaml
-
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 ARTICLES = REPO / "lambda" / "common" / "data" / "articles.json"
@@ -71,6 +69,8 @@ def to_testcases(rows: list[dict], article_ids: set[str]) -> list[dict]:
 
 
 def main() -> int:
+    import yaml  # 書き出すときだけ使う（read_rows などを import するだけなら pyyaml は要らない）
+
     ap = argparse.ArgumentParser()
     ap.add_argument("dataset", type=Path)
     ap.add_argument("--output", type=Path, default=HERE / "datasets" / "testcases.yaml")
