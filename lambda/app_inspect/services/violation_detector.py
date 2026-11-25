@@ -3,6 +3,11 @@
 旧仕様の RAG (関連条文 top_k=3 抽出) と NG ワード即確定経路は廃止済。
 context が十分広いモデルを用いる前提かつ、条文数も少数 (24+α) なので、
 articles.json + extra_articles (WS ローカルルール) を全部 LLM に渡す方式に統一。
+
+bedrock モード: 予備経路 (luna) と同じ 2 段の判定 (warn/safe と条文の候補 → 条文を 1 つ選ぶ) を、
+Amazon Bedrock の Converse API で行う。OpenAI の json_schema の代わりに、ツールを 1 つだけ渡して
+toolChoice で呼ばせ、その入力 (toolUse.input) を JSON の答えとして読む。Bedrock は enum を守る保証が
+無いので、答えの値はコードで確かめ、範囲外なら判定の失敗として扱う。
 """
 from functools import lru_cache
 import json
@@ -22,6 +27,13 @@ DECISIONS_TIMEOUT_SECONDS = 10
 DECISION_WARN_THRESHOLD = 0.5
 
 TOP_K = 3
+
+# Bedrock (Converse API)。ツール呼び出しでは temperature=0 (greedy) が推奨されている
+# (https://docs.aws.amazon.com/nova/latest/userguide/tool-use-definition.html)
+BEDROCK_TEMPERATURE = 0.0
+BEDROCK_MAX_TOKENS = 512
+BEDROCK_CONNECT_TIMEOUT_SECONDS = 5
+BEDROCK_READ_TIMEOUT_SECONDS = 20
 
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 _COMMON_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "common", "data")
@@ -116,15 +128,18 @@ class ViolationDetector:
         judge_model: str,
         articles_path: Optional[str] = None,
         detection_mode: Optional[str] = None,
+        bedrock_client=None,
     ):
         self.client = openai_client
         self.judge_model = judge_model
+        # bedrock モードのときだけ使う。渡されなければ初回の呼び出しで boto3 から作る
+        self._bedrock_client = bedrock_client
 
         mode_raw = detection_mode if detection_mode is not None else os.environ.get("DETECTION_MODE")
         mode = mode_raw.strip().lower() if mode_raw else ""
         if not mode:
             mode = "auto"
-        elif mode not in ("auto", "llm_score", "decisions", "luna"):
+        elif mode not in ("auto", "llm_score", "decisions", "luna", "bedrock"):
             logger.warning("Unknown detection mode '%s', falling back to 'auto'", mode_raw)
             mode = "auto"
 
@@ -132,6 +147,8 @@ class ViolationDetector:
             judge_model_norm = (self.judge_model or "").strip().lower()
             if judge_model_norm.startswith("gpt-4o-mini"):
                 resolved_mode = "llm_score"
+            elif "amazon.nova" in judge_model_norm:
+                resolved_mode = "bedrock"
             else:
                 resolved_mode = "decisions"
             logger.info(
@@ -181,6 +198,9 @@ class ViolationDetector:
         elif self.detection_mode == "luna":
             result = self._judge_by_chat_pipeline(text, articles)
             method = "Luna"
+        elif self.detection_mode == "bedrock":
+            result = self._judge_by_chat_pipeline(text, articles)
+            method = "Bedrock"
         else:
             result = self._judge_by_llm(text, articles)
             method = "LLM"
@@ -302,17 +322,76 @@ class ViolationDetector:
             },
         }
 
+        r = self._structured_json(prompt, response_format)
+        if self.detection_mode == "bedrock" and r.get("article_id") not in candidate_ids:
+            # Bedrock は enum を守る保証が無い。候補外なら失敗とし、_pick_article の予備 (候補の先頭) に任せる
+            raise ValueError(f"article_id is not in candidates: {r.get('article_id')!r}")
+        return {
+            "article_id": r.get("article_id"),
+            "reason": r.get("reason", ""),
+        }
+
+    def _structured_json(self, prompt: str, response_format: dict) -> dict:
+        """JSON の形を決めて LLM に答えさせ、dict で返す。
+
+        OpenAI: response_format (json_schema) をそのまま渡す (従来どおり)。
+        Bedrock: 同じスキーマのツールを 1 つ渡し、toolChoice でそのツールを呼ばせて、入力を答えとして読む。
+        """
+        if self.detection_mode == "bedrock":
+            js = response_format["json_schema"]
+            return self._converse_json(prompt, js["name"], js["schema"])
+
         resp = self.client.chat.completions.create(
             model=self.judge_model,
             messages=[{"role": "user", "content": prompt}],
             response_format=response_format,
         )
         content = (resp.choices[0].message.content or "").strip()
-        r = json.loads(content) if content else {}
-        return {
-            "article_id": r.get("article_id"),
-            "reason": r.get("reason", ""),
-        }
+        return json.loads(content) if content else {}
+
+    def _get_bedrock_client(self):
+        if self._bedrock_client is None:
+            import boto3
+            from botocore.config import Config
+
+            self._bedrock_client = boto3.client(
+                "bedrock-runtime",
+                region_name=os.environ.get("BEDROCK_REGION") or None,
+                config=Config(
+                    connect_timeout=BEDROCK_CONNECT_TIMEOUT_SECONDS,
+                    read_timeout=BEDROCK_READ_TIMEOUT_SECONDS,
+                ),
+            )
+        return self._bedrock_client
+
+    def _converse_json(self, prompt: str, tool_name: str, schema: dict) -> dict:
+        # Nova のツールの inputSchema は、最上位に type・properties・required しか書けない
+        # (https://docs.aws.amazon.com/nova/latest/userguide/tool-use-definition.html)
+        tool_schema = {k: v for k, v in schema.items() if k in ("type", "properties", "required")}
+        resp = self._get_bedrock_client().converse(
+            modelId=self.judge_model,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            inferenceConfig={"temperature": BEDROCK_TEMPERATURE, "maxTokens": BEDROCK_MAX_TOKENS},
+            toolConfig={
+                "tools": [
+                    {
+                        "toolSpec": {
+                            "name": tool_name,
+                            "description": "判定の結果を、決まった形で返す",
+                            "inputSchema": {"json": tool_schema},
+                        }
+                    }
+                ],
+                "toolChoice": {"tool": {"name": tool_name}},
+            },
+        )
+        for block in resp.get("output", {}).get("message", {}).get("content", []):
+            tool_use = block.get("toolUse")
+            if tool_use and tool_use.get("name") == tool_name:
+                answer = tool_use.get("input")
+                if isinstance(answer, dict):
+                    return answer
+        raise ValueError(f"Bedrock response has no toolUse for {tool_name} (stopReason={resp.get('stopReason')})")
 
     def _pick_article(
         self,
@@ -464,16 +543,14 @@ class ViolationDetector:
             },
         }
 
+        tag = "[bedrock]" if self.detection_mode == "bedrock" else "[luna]"
         try:
-            resp = self.client.chat.completions.create(
-                model=self.judge_model,
-                messages=[{"role": "user", "content": prompt}],
-                response_format=response_format,
-            )
-            content = (resp.choices[0].message.content or "").strip()
-            r = json.loads(content) if content else {}
+            r = self._structured_json(prompt, response_format)
 
             decision = r.get("decision")
+            if self.detection_mode == "bedrock" and decision not in ("warn", "safe"):
+                # enum の外の値を黙って safe にしない (取りこぼしと区別できなくなるため)
+                raise ValueError(f"decision is not warn/safe: {decision!r}")
             is_warn = (decision == "warn")
             step1_reason = r.get("reason", "")
 
@@ -501,10 +578,10 @@ class ViolationDetector:
                 article_id, step2_reason = self._pick_article(
                     text, candidate_ids, articles, step1_reason
                 )
-                final_reason = f"[luna] {step2_reason}"
+                final_reason = f"{tag} {step2_reason}"
             else:
                 article_id = None
-                final_reason = f"[luna] {step1_reason}"
+                final_reason = f"{tag} {step1_reason}"
 
             return {
                 "is_violation": is_warn,
